@@ -1,6 +1,6 @@
 {
   "name": "@powerhousedao/verdaccio-s3-storage",
-  "version": "12.1.3",
+  "version": "13.0.0",
   "description": "Verdaccio storage plugin: package files in S3, registry state in Postgres. Fork of verdaccio-aws-s3-storage.",
   "type": "module",
   "main": "./lib/index.js",

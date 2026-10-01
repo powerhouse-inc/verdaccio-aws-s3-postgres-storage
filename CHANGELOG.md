@@ -1,5 +1,11 @@
 # verdaccio-aws-s3-storage
 
+## 13.0.0
+
+### Major Changes
+
+- ae317f5: Publish as `@powerhousedao/verdaccio-s3-storage`, store the registry state in Postgres (`postgresUrl`, required), and use the Verdaccio 7 promise-based storage API. The DynamoDB and single-file bucket backends are removed.
+
 ## 12.1.3
 
 ### Patch Changes
