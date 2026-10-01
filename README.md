@@ -1,295 +1,68 @@
-# verdaccio-aws-s3-storage
+# @powerhousedao/verdaccio-s3-storage
 
-AWS S3 + DynamoDB storage plugin for [Verdaccio](https://verdaccio.org).
+Verdaccio 7 storage plugin that keeps package files in S3 and the registry state (package list, secret, tokens) in Postgres, so several Verdaccio instances can share one registry.
 
-Uses **S3** for package tarballs and metadata, and **DynamoDB** for the registry database (package list, secrets, tokens).
+Forked from [verdaccio-aws-s3-storage](https://github.com/verdaccio/verdaccio-aws-s3-storage) 12.1.3 (MIT). Changes from upstream:
 
-For AWS-compatible S3 that do not include DynamoDB, you can use **S3** for the registry data as well (as in older versions of the plugin).
+- **Verdaccio 7 API.** The package storage and the package list use the promise-based storage API of Verdaccio 7 (`@verdaccio/store` 9). Upstream still uses the callback API, which Verdaccio 7.0.0-next-7.29 crashes on.
+- **Postgres backend.** `postgresUrl` stores the registry state in Postgres, and is required. Upstream's DynamoDB backend, and its single JSON file in the bucket that every instance reads once and overwrites, are removed.
+- **Search** returns published packages whose name contains the query text.
 
-Built with AWS SDK for JavaScript v3.
-
-## Requirements
-
-- **Node.js** >= 24
-- **Verdaccio** >= 7.x
-- **AWS S3 Bucket** — stores package tarballs and `package.json` metadata
-- **AWS DynamoDB Table (optional)** — stores the registry state (package list, secret, auth tokens)
-  - Partition key: `pk` (String)
-  - Sort key: `sk` (String)
-  - Billing mode: PAY_PER_REQUEST (recommended) or provisioned
-- **AWS Credentials** — via environment variables, IAM role, instance profile, or explicit config
-
-### IAM Permissions
-
-The plugin requires the following IAM permissions:
-
-**S3:**
-
-- `s3:GetObject`
-- `s3:PutObject`
-- `s3:DeleteObject`
-- `s3:DeleteObjects` (for bulk deletes)
-- `s3:ListBucket` / `s3:ListObjectsV2`
-- `s3:HeadObject`
-
-**DynamoDB:**
-
-- `dynamodb:GetItem`
-- `dynamodb:PutItem`
-- `dynamodb:DeleteItem`
-- `dynamodb:Query`
-
-## Installation
+## Install
 
 ```bash
-npm install verdaccio-aws-s3-storage
+npm install @powerhousedao/verdaccio-s3-storage
 ```
+
+Or copy the built package into Verdaccio's `plugins` folder as `@powerhousedao/verdaccio-s3-storage`, as the [Dockerfile](Dockerfile) does.
 
 ## Configuration
 
-Add to your Verdaccio `config.yaml`:
-
 ```yaml
 store:
-  aws-s3-storage:
-    bucket: your-s3-bucket
-    keyPrefix: some-prefix # optional, nests all files under a subdirectory
-    region: us-east-1 # optional, defaults to AWS SDK default
-    endpoint: https://s3.us-east-1.amazonaws.com # optional
-    s3ForcePathStyle: false # optional, required for MinIO/LocalStack
-    tarballACL: private # optional, use 'public-read' for CDN (e.g. CloudFront)
-    accessKeyId: your-key # optional, uses AWS credential chain if omitted
-    secretAccessKey: your-secret # optional
-    sessionToken: your-token # optional
-    proxy: https://your-proxy # optional
-
-    # DynamoDB
-    dynamoTableName: verdaccio-registry
-    dynamoEndpoint: https://dynamodb.us-east-1.amazonaws.com # optional
-    dynamoRegion: us-east-1 # optional, defaults to 'region'
-    # or
-    dynamoTableName: none
+  '@powerhousedao/verdaccio-s3-storage':
+    bucket: registry
+    keyPrefix: prod # optional
+    endpoint: https://nbg1.your-objectstorage.com # optional
+    region: eu-central # optional
+    s3ForcePathStyle: true # optional, for MinIO and most S3-compatible stores
+    accessKeyId: S3_ACCESS_KEY_ID # optional, uses the AWS credential chain if omitted
+    secretAccessKey: S3_SECRET_ACCESS_KEY # optional
+    postgresUrl: DATABASE_URL
+    postgresPoolMax: 2 # optional: reads and writes outside a package lock
+    postgresLockPoolMax: 4 # optional: one connection per concurrent manifest write
 ```
 
-### Environment variable substitution
+A value that names a set environment variable is replaced by that variable, as in upstream.
 
-Config values can reference environment variables by name. If the environment variable is set, its value is used; otherwise the literal string is used as-is.
+## Postgres
 
-```yaml
-store:
-  aws-s3-storage:
-    bucket: AWS_S3_BUCKET # uses $AWS_S3_BUCKET if set, otherwise literal "AWS_S3_BUCKET"
-    keyPrefix: AWS_S3_KEY_PREFIX
-    region: AWS_DEFAULT_REGION
-    endpoint: AWS_S3_ENDPOINT
-    accessKeyId: AWS_ACCESS_KEY_ID
-    secretAccessKey: AWS_SECRET_ACCESS_KEY
-    sessionToken: AWS_SESSION_TOKEN
-    dynamoTableName: AWS_DYNAMO_TABLE_NAME
-    dynamoEndpoint: AWS_DYNAMO_ENDPOINT
-    dynamoRegion: AWS_DYNAMO_REGION
-```
+The plugin creates its tables on first use, under an advisory lock so instances starting together don't race:
 
-### Environment variables reference
+| Table                 | Holds                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------- |
+| `verdaccio_packages`  | names of packages published to this registry                                                      |
+| `verdaccio_tokens`    | npm tokens, per user and key                                                                      |
+| `verdaccio_secret`    | the signing secret, stored by the first instance to start                                         |
+| `verdaccio_manifests` | versions, dist-tags and revision of each package published here, written with every manifest save |
 
-The following environment variables are used by the Docker image and the plugin when config values reference them:
+Package manifests, tarballs and dist-tags stay in S3.
 
-#### S3
-
-| Variable             | Required | Description                                                                              |
-| -------------------- | -------- | ---------------------------------------------------------------------------------------- |
-| `AWS_S3_BUCKET`      | Yes      | S3 bucket name for storing packages                                                      |
-| `AWS_S3_KEY_PREFIX`  | No       | Prefix (subdirectory) for all S3 keys. Default: none                                     |
-| `AWS_S3_ENDPOINT`    | No       | Custom S3 endpoint URL. Required for LocalStack or MinIO. Omit for real AWS              |
-| `AWS_DEFAULT_REGION` | No       | AWS region for S3 and DynamoDB (if `AWS_DYNAMO_REGION` is not set). Default: SDK default |
-
-#### DynamoDB
-
-| Variable                | Required | Description                                                                                       |
-| ----------------------- | -------- | ------------------------------------------------------------------------------------------------- |
-| `AWS_DYNAMO_TABLE_NAME` | Yes      | DynamoDB table name (must have `pk`/`sk` key schema). Set to 'none' to use S3 instead of DynamoDB |
-| `AWS_DYNAMO_ENDPOINT`   | No       | Custom DynamoDB endpoint URL. Required for LocalStack. Omit for real AWS                          |
-| `AWS_DYNAMO_REGION`     | No       | AWS region for DynamoDB. Falls back to `AWS_DEFAULT_REGION`                                       |
-
-#### Authentication
-
-| Variable                | Required | Description                                                       |
-| ----------------------- | -------- | ----------------------------------------------------------------- |
-| `AWS_ACCESS_KEY_ID`     | No       | AWS access key. Omit to use IAM roles, instance profiles, or IRSA |
-| `AWS_SECRET_ACCESS_KEY` | No       | AWS secret key. Required if `AWS_ACCESS_KEY_ID` is set            |
-| `AWS_SESSION_TOKEN`     | No       | AWS session token for temporary credentials (STS)                 |
-
-#### Debug
-
-| Variable | Required | Description                                                                                                      |
-| -------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
-| `DEBUG`  | No       | Enable [debug](https://www.npmjs.com/package/debug) output. Set to `verdaccio:plugin*` for all plugin namespaces |
-
-Available debug namespaces:
-
-- `verdaccio:plugin:aws-s3-storage:database:dynamo` — DynamoDB operations (add, remove, get, tokens, secret)
-- `verdaccio:plugin:aws-s3-storage:database:bucket` — S3 registry operations (add, remove, get, tokens, secret)
-- `verdaccio:plugin:aws-s3-storage:package` — S3 package operations (read, write, create, delete, tarballs)
-- `verdaccio:plugin:aws-s3-storage:s3-client` — S3 client initialization
-- `verdaccio:plugin:aws-s3-storage:dynamo-client` — DynamoDB client initialization
-- `verdaccio:plugin:aws-s3-storage:delete-prefix` — S3 prefix deletion
-- `verdaccio:plugin:aws-s3-storage:errors` — AWS error conversion
-- `verdaccio:plugin:aws-s3-storage:config` — config value resolution from env vars
-
-### Custom storage per package scope
-
-```yaml
-packages:
-  '@scope/*':
-    access: $all
-    publish: $all
-    storage: 'scoped' # stored under keyPrefix/scoped/@scope/pkg/
-  '**':
-    access: $all
-    publish: $all
-    proxy: npmjs
-    storage: 'public'
-```
-
-### Tarball ACL
-
-Set `tarballACL: public-read` to grant anonymous read access for CDN integration (e.g. Amazon CloudFront).
-
-## Architecture
-
-```
-                   +-----------+
-                   | Verdaccio |
-                   +-----+-----+
-                         |
-            +------------+------------+
-            |                         |
-      S3DatabaseDynamo         S3PackageManager
-      (registry state)         (per-package storage)
-            |                         |
-       DynamoDB                      S3
-   +-----------------+      +------------------+
-   | pk=CONFIG       |      | pkg/package.json |
-   | pk=PACKAGE      |      | pkg/tarball.tgz  |
-   | pk=TOKEN#user   |      +------------------+
-   +-----------------+
-```
-
-or
-
-```
-                   +-----------+
-                   | Verdaccio |
-                   +-----+-----+
-                         |
-            +------------+------------+
-            |                         |
-      S3DatabaseBucket         S3PackageManager
-      (registry state)         (per-package storage)
-            |                         |
-           S3                        S3
-   +---------------------+  +------------------+
-   | verdaccio-s3-db.json|  | pkg/package.json |
-   +---------------------+  | pkg/tarball.tgz  |
-                            +------------------+
-```
-
-**S3Database** handles registry operations via DynamoDB or S3:
-
-- Package list (`add`, `remove`, `get`)
-- Secret management (`getSecret`, `setSecret`)
-- Auth tokens (`saveToken`, `deleteToken`, `readTokens`)
-
-**S3PackageManager** handles per-package operations via S3:
-
-- Package metadata (`readPackage`, `savePackage`, `createPackage`, `deletePackage`)
-- Tarballs (`readTarball`, `writeTarball`)
-
-### DynamoDB table schema
-
-Single-table design with partition key `pk` and sort key `sk`:
-
-| pk             | sk              | Description         |
-| -------------- | --------------- | ------------------- |
-| `CONFIG`       | `SECRET`        | Registry secret key |
-| `PACKAGE`      | `{packageName}` | Package entry       |
-| `TOKEN#{user}` | `{tokenKey}`    | Auth token          |
-
-## Development
-
-See [LOCAL_DEV.md](LOCAL_DEV.md) for the full local development guide, including:
-
-- Setup, build, test, and lint commands
-- Running Verdaccio + LocalStack via Docker Compose
-- Inspecting S3 and DynamoDB data in LocalStack
-- Debug logging namespaces
-- Helm + LocalStack example for Kubernetes
-
-### Creating the DynamoDB table (production)
-
-#### AWS CLI
+## Tests
 
 ```bash
-aws dynamodb create-table \
-  --table-name verdaccio-registry \
-  --attribute-definitions \
-    AttributeName=pk,AttributeType=S \
-    AttributeName=sk,AttributeType=S \
-  --key-schema \
-    AttributeName=pk,KeyType=HASH \
-    AttributeName=sk,KeyType=RANGE \
-  --billing-mode PAY_PER_REQUEST
+pnpm build && pnpm test
 ```
 
-#### Terraform
+See [LOCAL_DEV.md](LOCAL_DEV.md) for the Docker setup with LocalStack and Postgres.
 
-```hcl
-resource "aws_dynamodb_table" "verdaccio" {
-  name         = "verdaccio-registry"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pk"
-  range_key    = "sk"
+The verifier test loads the built package. The S3 package storage tests run against real S3, and the Postgres tests also run against a real server, when these are set:
 
-  attribute {
-    name = "pk"
-    type = "S"
-  }
-
-  attribute {
-    name = "sk"
-    type = "S"
-  }
-}
+```bash
+VERDACCIO_S3_STORAGE_TEST_S3_ENDPOINT=http://localhost:9000   # MinIO, minio / minio12345
+VERDACCIO_S3_STORAGE_TEST_S3_ACCESS_KEY=test                  # optional, e.g. for LocalStack
+VERDACCIO_S3_STORAGE_TEST_S3_SECRET_KEY=test
+VERDACCIO_S3_STORAGE_TEST_PG_URL=postgres://postgres:postgres@localhost:5432/verdaccio
 ```
 
-#### CloudFormation
-
-```yaml
-Resources:
-  VerdaccioTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      TableName: verdaccio-registry
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: pk
-          AttributeType: S
-        - AttributeName: sk
-          AttributeType: S
-      KeySchema:
-        - AttributeName: pk
-          KeyType: HASH
-        - AttributeName: sk
-          KeyType: RANGE
-```
-
-## Scaling & Production Deployment
-
-The plugin is fully stateless and supports horizontal scaling. Run multiple Verdaccio instances behind a load balancer — all instances share the same S3 bucket and DynamoDB table.
-
-- [Scaling guide](docs/scaling.md) — architecture, concurrency safety, ECS/Fargate, Kubernetes, monitoring, cost estimation
-- [Helm example](examples/helm/) — deploy on Kubernetes using the official Verdaccio Helm chart with IRSA support
-
-## License
-
-MIT
+Without them, the Postgres tests run on PGlite and the S3 tests are skipped. CI sets them against Postgres and LocalStack.

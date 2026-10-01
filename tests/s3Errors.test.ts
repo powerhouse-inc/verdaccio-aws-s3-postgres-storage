@@ -6,7 +6,7 @@ import {
   is503Error,
   create503Error,
   convertS3Error,
-} from '../src/s3Errors';
+} from '../src/s3Errors.js';
 
 import {describe, test, expect} from 'vitest';
 
@@ -63,13 +63,19 @@ describe('s3Errors', () => {
     });
 
     test('converts StreamContentLengthMismatch to 500', () => {
-      const err = convertS3Error({name: 'StreamContentLengthMismatch', message: 'mismatch'});
+      const err = convertS3Error({
+        name: 'StreamContentLengthMismatch',
+        message: 'mismatch',
+      });
       expect(err.code).toBe(500);
       expect(err.message).toContain('content length mismatch');
     });
 
     test('converts RequestAbortedError to 500', () => {
-      const err = convertS3Error({name: 'RequestAbortedError', message: 'aborted'});
+      const err = convertS3Error({
+        name: 'RequestAbortedError',
+        message: 'aborted',
+      });
       expect(err.code).toBe(500);
       expect(err.message).toContain('request aborted');
     });

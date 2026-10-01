@@ -1,4 +1,4 @@
-import addTrailingSlash from '../src/addTrailingSlash';
+import addTrailingSlash from '../src/addTrailingSlash.js';
 
 import {describe, test, expect} from 'vitest';
 
@@ -16,7 +16,7 @@ describe('addTrailingSlash', () => {
   });
 
   test('returns empty string for null', () => {
-    expect(addTrailingSlash(null as any)).toBe('');
+    expect(addTrailingSlash(null as unknown as undefined)).toBe('');
   });
 
   test('handles single segment path', () => {
