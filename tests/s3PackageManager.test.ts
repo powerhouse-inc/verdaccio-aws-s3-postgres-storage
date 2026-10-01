@@ -1,419 +1,247 @@
-import type {Logger, Package} from '@verdaccio/types';
+import type {Logger, Manifest} from '@verdaccio/types';
 
-import S3PackageManager from '../src/s3PackageManager';
-import type {S3Config} from '../types';
+import {createS3Client} from '../src/s3Client.js';
+import S3PackageManager from '../src/s3PackageManager.js';
+import type {ManifestIndex, S3Config} from '../src/types.js';
 
-import {HeadObjectCommand, PutObjectCommand, DeleteObjectCommand} from '@aws-sdk/client-s3';
-import type {S3Client} from '@aws-sdk/client-s3';
-import {PassThrough} from 'stream';
-import {describe, test, expect, vi} from 'vitest';
+import {CreateBucketCommand} from '@aws-sdk/client-s3';
+import {randomUUID} from 'node:crypto';
+import {once} from 'node:events';
+import {Readable} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
+import {beforeAll, describe, expect, test} from 'vitest';
 
-const logger: Logger = {
-  error: vi.fn(),
-  info: vi.fn(),
-  debug: vi.fn(),
-  warn: vi.fn(),
-  child: vi.fn(),
-  http: vi.fn(),
-  trace: vi.fn(),
-} as any;
+// Set to run against real S3, e.g. MinIO at http://localhost:9000 with minio/minio12345
+const ENDPOINT = process.env.VERDACCIO_S3_STORAGE_TEST_S3_ENDPOINT;
 
-const pkg: Package = {
-  name: 'test-package',
-  versions: {},
-  'dist-tags': {},
-  _attachments: {},
-  _uplinks: {},
-  _rev: '',
-} as Package;
+const logger = {
+  error: () => {},
+  warn: () => {},
+  info: () => {},
+  debug: () => {},
+  trace: () => {},
+} as unknown as Logger;
 
-function makeConfig(overrides: Partial<S3Config> = {}): S3Config {
+const config = {
+  bucket: 'verdaccio-s3-storage-test',
+  keyPrefix: `test-${randomUUID()}/`,
+  endpoint: ENDPOINT,
+  region: 'us-east-1',
+  s3ForcePathStyle: true,
+  accessKeyId: process.env.VERDACCIO_S3_STORAGE_TEST_S3_ACCESS_KEY ?? 'minio',
+  secretAccessKey: process.env.VERDACCIO_S3_STORAGE_TEST_S3_SECRET_KEY ?? 'minio12345',
+} as S3Config;
+
+function manifest(name: string): Manifest {
   return {
-    bucket: 'test-bucket',
-    keyPrefix: 'prefix/',
-    dynamoTableName: 'test-table',
-    ...overrides,
-  } as S3Config;
+    name,
+    versions: {},
+    'dist-tags': {},
+    _attachments: {},
+    _uplinks: {},
+    _distfiles: {},
+    _rev: '1-0',
+  } as unknown as Manifest;
 }
 
-type SendHandler = (command: any) => any;
-
-function createFakeS3(handler: SendHandler): S3Client & {send: ReturnType<typeof vi.fn>} {
-  return {
-    send: vi.fn(async (command: any) => {
-      const result = handler(command);
-      if (result instanceof Error) throw result;
-      return result;
-    }),
-  } as any;
+function storage(index?: ManifestIndex): S3PackageManager {
+  return new S3PackageManager(config, `pkg-${randomUUID()}`, logger, createS3Client(config), index);
 }
 
-function s3Error(name: string, statusCode = 500): Error {
-  const err: any = new Error(name);
-  err.name = name;
-  err.$metadata = {httpStatusCode: statusCode};
-  return err;
+// Records the calls the package storage makes to its manifest index
+function recordingIndex() {
+  const calls: string[] = [];
+  const index: ManifestIndex = {
+    record: (name) => {
+      calls.push(`record ${name}`);
+      return Promise.resolve();
+    },
+    forget: (name) => {
+      calls.push(`forget ${name}`);
+      return Promise.resolve();
+    },
+    withPackageLock: (name, fn) => {
+      calls.push(`lock ${name}`);
+      return fn(index);
+    },
+    revision: () => Promise.resolve(null),
+  };
+  return {calls, index};
 }
 
-function cbToPromise<T = any>(fn: (cb: (...args: any[]) => void) => void): Promise<T[]> {
-  return new Promise((resolve) => {
-    fn((...args: any[]) => resolve(args));
-  });
+function signal(): AbortSignal {
+  return new AbortController().signal;
 }
 
-describe('S3PackageManager', () => {
-  describe('constructor', () => {
-    test('builds packagePath with keyPrefix', () => {
-      const s3 = createFakeS3(() => ({}));
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      expect(pm).toBeDefined();
-      expect(pm.config.bucket).toBe('test-bucket');
-    });
+async function read(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks);
+}
 
-    test('uses custom storage folder when getMatchedPackagesSpec returns storage', () => {
-      const config = makeConfig({
-        getMatchedPackagesSpec: vi.fn(() => ({storage: 'custom'})),
-      } as any);
-      const s3 = createFakeS3(() => ({}));
-      const pm = new S3PackageManager(config, '@scope/pkg', logger, s3);
-      expect(pm).toBeDefined();
-    });
-  });
-
-  describe('createPackage', () => {
-    test('creates a new package when it does not exist', async () => {
-      const s3 = createFakeS3((cmd) => {
-        if (cmd instanceof HeadObjectCommand) throw s3Error('NotFound', 404);
-        return {};
-      });
-
-      const pm = new S3PackageManager(makeConfig(), 'new-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.createPackage('test.tgz', pkg, cb));
-      expect(err).toBeNull();
-    });
-
-    test('returns 409 when package already exists', async () => {
-      const s3 = createFakeS3((cmd) => {
-        if (cmd instanceof HeadObjectCommand) return {};
-        return {};
-      });
-
-      const pm = new S3PackageManager(makeConfig(), 'existing-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.createPackage('test.tgz', pkg, cb));
-      expect(err).toBeTruthy();
-      expect((err as any).code).toBe(409);
-    });
-  });
-
-  describe('savePackage', () => {
-    test('puts object to S3', async () => {
-      const s3 = createFakeS3(() => ({}));
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.savePackage('pkg.json', pkg, cb));
-      expect(err).toBeNull();
-
-      const putCall = s3.send.mock.calls[0][0];
-      expect(putCall).toBeInstanceOf(PutObjectCommand);
-      expect(putCall.input.Bucket).toBe('test-bucket');
-      expect(putCall.input.Body).toContain('test-package');
-    });
-
-    test('forwards S3 errors to callback', async () => {
-      const s3 = createFakeS3(() => {
-        throw new Error('S3 write failed');
-      });
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.savePackage('pkg.json', pkg, cb));
-      expect(err).toBeTruthy();
-      expect((err as any).message).toBe('S3 write failed');
-    });
-  });
-
-  describe('readPackage', () => {
-    test('reads and parses package from S3', async () => {
-      const s3 = createFakeS3(() => ({
-        Body: {transformToString: async () => JSON.stringify(pkg)},
-      }));
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const [err, data] = await cbToPromise((cb) => pm.readPackage('pkg.json', cb));
-      expect(err).toBeNull();
-      expect(data.name).toBe('test-package');
-    });
-
-    test('returns error when package does not exist', async () => {
-      const s3 = createFakeS3(() => {
-        throw s3Error('NoSuchKey', 404);
-      });
-
-      const pm = new S3PackageManager(makeConfig(), 'missing-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.readPackage('pkg.json', cb));
-      expect(err).toBeTruthy();
-      expect((err as any).code).toBe(404);
-    });
-  });
-
-  describe('deletePackage', () => {
-    test('deletes object from S3', async () => {
-      const s3 = createFakeS3(() => ({}));
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.deletePackage('test-file.tgz', cb));
-      expect(err).toBeNull();
-
-      const deleteCall = s3.send.mock.calls[0][0];
-      expect(deleteCall).toBeInstanceOf(DeleteObjectCommand);
-      expect(deleteCall.input.Key).toContain('test-file.tgz');
-    });
-  });
-
-  describe('removePackage', () => {
-    test('removes all objects under package prefix', async () => {
-      const s3 = createFakeS3((cmd) => {
-        const name = cmd.constructor.name;
-        if (name === 'ListObjectsV2Command') {
-          return {KeyCount: 1, Contents: [{Key: 'prefix/my-pkg/package.json'}]};
+describe.skipIf(!ENDPOINT)('S3PackageManager (real S3)', () => {
+  beforeAll(async () => {
+    await createS3Client(config)
+      .send(new CreateBucketCommand({Bucket: config.bucket}))
+      .catch((err: {name?: string}) => {
+        if (err.name !== 'BucketAlreadyOwnedByYou' && err.name !== 'BucketAlreadyExists') {
+          throw err;
         }
-        return {};
       });
+  });
 
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.removePackage(cb));
-      expect(err).toBeNull();
-    });
+  test('creates, reads and saves a package manifest', async () => {
+    const pm = storage();
+    expect(await pm.hasPackage()).toBe(false);
+    await pm.createPackage('a', manifest('a'));
+    expect(await pm.hasPackage()).toBe(true);
+    expect(await pm.readPackage('a')).toEqual(manifest('a'));
 
-    test('succeeds even when package prefix is empty (404)', async () => {
-      const s3 = createFakeS3((cmd) => {
-        const name = cmd.constructor.name;
-        if (name === 'ListObjectsV2Command') {
-          return {KeyCount: 0, Contents: []};
-        }
-        return {};
-      });
+    await pm.savePackage('a', {...manifest('a'), _rev: '2-0'});
+    expect((await pm.readPackage('a'))._rev).toBe('2-0');
+  });
 
-      const pm = new S3PackageManager(makeConfig(), 'empty-pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.removePackage(cb));
-      expect(err).toBeNull();
+  test('createPackage fails with 409 when the package exists', async () => {
+    const pm = storage();
+    await pm.createPackage('a', manifest('a'));
+    await expect(pm.createPackage('a', manifest('a'))).rejects.toMatchObject({
+      code: 409,
     });
   });
 
-  describe('updatePackage', () => {
-    test('reads data, calls updateHandler, transforms, and writes', async () => {
-      const pkgData = {...pkg, _rev: '1'};
-      const s3 = createFakeS3(() => ({
-        Body: {transformToString: async () => JSON.stringify(pkgData)},
-      }));
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-
-      const updateHandler = vi.fn((_json: any, cb: any) => cb(null));
-      const transformPackage = vi.fn((json: any) => ({...json, _rev: '2'}));
-      const onWrite = vi.fn((_name: string, _pkg: any, cb: any) => cb(null));
-
-      const [err] = await cbToPromise((cb) =>
-        pm.updatePackage('my-pkg', updateHandler, onWrite, transformPackage, cb)
-      );
-      expect(err).toBeNull();
-      expect(updateHandler).toHaveBeenCalledOnce();
-      expect(transformPackage).toHaveBeenCalledOnce();
-      expect(onWrite).toHaveBeenCalledOnce();
-    });
-
-    test('forwards error from _getData', async () => {
-      const s3 = createFakeS3(() => {
-        throw s3Error('NoSuchKey', 404);
-      });
-
-      const pm = new S3PackageManager(makeConfig(), 'missing', logger, s3);
-      const [err] = await cbToPromise((cb) =>
-        pm.updatePackage('missing', vi.fn(), vi.fn(), vi.fn(), cb)
-      );
-      expect(err).toBeTruthy();
-    });
-
-    test('forwards error from updateHandler', async () => {
-      const s3 = createFakeS3(() => ({
-        Body: {transformToString: async () => JSON.stringify(pkg)},
-      }));
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const updateErr = new Error('update failed');
-
-      const [err] = await cbToPromise((cb) =>
-        pm.updatePackage(
-          'my-pkg',
-          (_json: any, innerCb: any) => innerCb(updateErr),
-          vi.fn(),
-          vi.fn(),
-          cb
-        )
-      );
-      expect(err).toBe(updateErr);
+  test('readPackage of a missing package fails with 404', async () => {
+    await expect(storage().readPackage('missing')).rejects.toMatchObject({
+      code: 404,
     });
   });
 
-  describe('readTarball', () => {
-    test('emits content-length, open, and pipes data', async () => {
-      const bodyStream = new PassThrough();
-
-      const s3 = createFakeS3(() => ({ContentLength: 1024, Body: bodyStream}));
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const stream = pm.readTarball('file.tgz');
-
-      const events: string[] = [];
-      let contentLength = 0;
-
-      stream.on('content-length', (len: number) => {
-        contentLength = len;
-        events.push('content-length');
-      });
-      stream.on('open', () => events.push('open'));
-
-      const chunks: Buffer[] = [];
-      stream.on('data', (chunk: Buffer) => chunks.push(chunk));
-
-      await new Promise<void>((resolve) => {
-        stream.on('end', () => {
-          events.push('end');
-          resolve();
-        });
-        setTimeout(() => {
-          bodyStream.end(Buffer.from('tarball-data'));
-        }, 10);
-      });
-
-      expect(contentLength).toBe(1024);
-      expect(events).toContain('content-length');
-      expect(events).toContain('open');
-      expect(Buffer.concat(chunks).toString()).toBe('tarball-data');
-    });
-
-    test('emits error when object does not exist', async () => {
-      const s3 = createFakeS3(() => {
-        throw s3Error('NoSuchKey', 404);
-      });
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const stream = pm.readTarball('missing.tgz');
-
-      const err = await new Promise<any>((resolve) => {
-        stream.on('error', resolve);
-      });
-      expect(err.code).toBe(404);
+  test('updatePackage returns the handler result without writing it', async () => {
+    const pm = storage();
+    await pm.createPackage('a', manifest('a'));
+    const updated = await pm.updatePackage('a', (data) => Promise.resolve({...data, _rev: '9-0'}));
+    expect(updated._rev).toBe('9-0');
+    expect((await pm.readPackage('a'))._rev).toBe('1-0');
+    await expect(
+      storage().updatePackage('missing', (data) => Promise.resolve(data))
+    ).rejects.toMatchObject({
+      code: 404,
     });
   });
 
-  describe('writeTarball', () => {
-    test('emits error when file already exists', async () => {
-      const s3 = createFakeS3((cmd) => {
-        if (cmd instanceof HeadObjectCommand) return {};
-        return {};
-      });
+  test('writes a tarball, closing only once it is stored', async () => {
+    const pm = storage();
+    const content = Buffer.alloc(6 * 1024 * 1024, 7);
+    const stream = await pm.writeTarball('a-1.0.0.tgz', {signal: signal()});
+    await once(stream, 'open');
+    const closed = once(stream, 'close').then(() => pm.hasTarball('a-1.0.0.tgz'));
+    await pipeline(Readable.from([content.subarray(0, 1000), content.subarray(1000)]), stream);
+    expect(await closed).toBe(true);
 
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const stream = pm.writeTarball('existing.tgz');
-
-      const err = await new Promise<any>((resolve) => {
-        stream.on('error', resolve);
-      });
-      expect(err.code).toBe(409);
-    });
-
-    test('emits open when file does not exist', async () => {
-      const s3 = createFakeS3((cmd) => {
-        if (cmd instanceof HeadObjectCommand) throw s3Error('NotFound', 404);
-        return {};
-      });
-
-      const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-      const stream = pm.writeTarball('new.tgz');
-
-      const opened = await new Promise<boolean>((resolve) => {
-        stream.on('open', () => resolve(true));
-        stream.on('error', () => resolve(false));
-      });
-      expect(opened).toBe(true);
-    });
-
-    test('failed upload without done() does not produce an unhandledRejection', async () => {
-      // Head 404 lets the upload start; every other command fails, so upload.done() rejects.
-      const s3 = createFakeS3((cmd) => {
-        if (cmd instanceof HeadObjectCommand) throw s3Error('NotFound', 404);
-        throw s3Error('RequestAbortedError', 500);
-      });
-
-      const unhandled: unknown[] = [];
-      const onUnhandled = (reason: unknown): void => {
-        unhandled.push(reason);
-      };
-      process.on('unhandledRejection', onUnhandled);
-
-      try {
-        const pm = new S3PackageManager(makeConfig(), 'my-pkg', logger, s3);
-        const stream = pm.writeTarball('aborted.tgz');
-
-        // An aborted client never calls stream.done(), so nothing awaits the upload.
-        await new Promise<void>((resolve) => {
-          stream.on('error', () => resolve());
-          stream.on('open', () => {
-            stream.write(Buffer.from('x'));
-            stream.end();
-          });
-        });
-        // Give Node a full turn to report an unhandled rejection, if there is one.
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      } finally {
-        process.off('unhandledRejection', onUnhandled);
-      }
-
-      expect(unhandled).toEqual([]);
-    });
+    const tarball = await pm.readTarball('a-1.0.0.tgz', {signal: signal()});
+    const [length] = await Promise.all([once(tarball, 'content-length'), once(tarball, 'open')]);
+    expect(length).toEqual([content.length]);
+    expect((await read(tarball)).equals(content)).toBe(true);
   });
 
-  describe('packagePath with custom storage', () => {
-    test('uses custom storage prefix in S3 keys', async () => {
-      const config = makeConfig({
-        getMatchedPackagesSpec: vi.fn(() => ({storage: 'customFolder'})),
-      } as any);
-
-      const s3 = createFakeS3((cmd) => {
-        if (cmd instanceof HeadObjectCommand) throw s3Error('NotFound', 404);
-        return {};
-      });
-
-      const pm = new S3PackageManager(config, '@scope/pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.createPackage('test', pkg, cb));
-      expect(err).toBeNull();
-
-      // HeadObject should have used the custom storage path
-      const headCall = s3.send.mock.calls[0][0];
-      expect(headCall.input.Key).toBe('prefix/customFolder/@scope/pkg/package.json');
-      // PutObject should have used the same path
-      const putCall = s3.send.mock.calls[1][0];
-      expect(putCall.input.Key).toBe('prefix/customFolder/@scope/pkg/package.json');
+  test('an aborted upload stores nothing', async () => {
+    const pm = storage();
+    const controller = new AbortController();
+    const stream = await pm.writeTarball('a-1.0.0.tgz', {
+      signal: controller.signal,
     });
+    await once(stream, 'open');
+    stream.write(Buffer.alloc(1024));
+    const failed = once(stream, 'error');
+    controller.abort();
+    const [err] = (await failed) as [Error];
+    expect(err.name).toBe('AbortError');
+    expect(await pm.hasTarball('a-1.0.0.tgz')).toBe(false);
+  });
 
-    test('uses default keyPrefix when no custom storage', async () => {
-      const config = makeConfig({
-        getMatchedPackagesSpec: vi.fn(() => null),
-      } as any);
-
-      const s3 = createFakeS3((cmd) => {
-        if (cmd instanceof HeadObjectCommand) throw s3Error('NotFound', 404);
-        return {};
-      });
-
-      const pm = new S3PackageManager(config, '@scope/pkg', logger, s3);
-      const [err] = await cbToPromise((cb) => pm.createPackage('test', pkg, cb));
-      expect(err).toBeNull();
-
-      const headCall = s3.send.mock.calls[0][0];
-      expect(headCall.input.Key).toBe('prefix/@scope/pkg/package.json');
-      const putCall = s3.send.mock.calls[1][0];
-      expect(putCall.input.Key).toBe('prefix/@scope/pkg/package.json');
+  test('reading a missing tarball fails with 404', async () => {
+    const tarball = await storage().readTarball('missing.tgz', {
+      signal: signal(),
     });
+    const [err] = (await once(tarball, 'error')) as [Error];
+    expect(err).toMatchObject({code: 404});
+  });
+
+  test('deletes files and removes the package', async () => {
+    const pm = storage();
+    await pm.createPackage('a', manifest('a'));
+    const stream = await pm.writeTarball('a-1.0.0.tgz', {signal: signal()});
+    await pipeline(Readable.from([Buffer.from('tarball')]), stream);
+
+    await pm.deletePackage('a-1.0.0.tgz');
+    expect(await pm.hasTarball('a-1.0.0.tgz')).toBe(false);
+    expect(await pm.hasPackage()).toBe(true);
+
+    await pm.removePackage();
+    expect(await pm.hasPackage()).toBe(false);
+    await pm.removePackage();
+  });
+
+  test('keeps the manifest index in step with saves and removals', async () => {
+    const {calls, index} = recordingIndex();
+    const pm = storage(index);
+    await pm.createPackage('a', manifest('a'));
+    await pm.savePackage('a', {...manifest('a'), _rev: '2-0'});
+    await pm.savePackage('a', {...manifest('a'), _rev: '2-1'});
+    await pm.deletePackage('a-1.0.0.tgz');
+    await pm.deletePackage('package.json');
+    await pm.removePackage();
+    const name = calls[0].split(' ')[1];
+    expect(calls).toEqual([
+      `lock ${name}`,
+      `record ${name}`,
+      `lock ${name}`,
+      `record ${name}`,
+      `lock ${name}`,
+      `lock ${name}`,
+      `lock ${name}`,
+      `forget ${name}`,
+      `lock ${name}`,
+      `forget ${name}`,
+    ]);
+  });
+
+  test("with an index, updatePackage stores the result and skips Verdaccio's echo", async () => {
+    const {calls, index} = recordingIndex();
+    const pm = storage(index);
+    await pm.createPackage('a', manifest('a'));
+    const updated = await pm.updatePackage('a', (data) => Promise.resolve({...data, readme: 'hi'}));
+    expect(updated._rev).toMatch(/^2-[0-9a-f]{16}$/);
+    expect(await pm.readPackage('a')).toEqual(updated);
+
+    const written = updated._rev;
+    updated._rev = '3-0';
+    await pm.savePackage('a', updated);
+    expect(updated._rev).toBe(written);
+    expect((await pm.readPackage('a'))._rev).toBe(written);
+    expect(calls.filter((c) => c.startsWith('record'))).toHaveLength(2);
+  });
+
+  test('a failed index update leaves no stale manifest cached', async () => {
+    let rev: string | null = null;
+    let failRecord = false;
+    const index: ManifestIndex = {
+      record: (_name, m) => {
+        if (failRecord) return Promise.reject(new Error('postgres down'));
+        rev = (m as Manifest)._rev;
+        return Promise.resolve();
+      },
+      forget: () => Promise.resolve(),
+      withPackageLock: (_name, fn) => fn(index),
+      revision: () => Promise.resolve(rev),
+    };
+    const pm = storage(index);
+    await pm.createPackage('a', manifest('a'));
+    expect((await pm.readPackage('a'))._rev).toBe('1-0');
+
+    failRecord = true;
+    await expect(pm.savePackage('a', {...manifest('a'), _rev: '2-0'})).rejects.toThrow(
+      'postgres down'
+    );
+    expect((await pm.readPackage('a'))._rev).toBe('2-0');
   });
 });

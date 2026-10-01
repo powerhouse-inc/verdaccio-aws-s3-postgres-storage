@@ -29,14 +29,19 @@ export function create503Error(): VerdaccioError {
   return errorUtils.getCode(503, 'resource temporarily unavailable');
 }
 
-export function convertS3Error(err: any): VerdaccioError {
-  const errorName = err.name || err.code || '';
-  debug(
-    'converting AWS error name=%o statusCode=%o message=%o',
-    errorName,
-    err.$metadata?.httpStatusCode || err.statusCode,
-    err.message
-  );
+type AwsError = {
+  name?: string;
+  code?: string | number;
+  message?: string;
+  statusCode?: number;
+  $metadata?: {httpStatusCode?: number};
+};
+
+export function convertS3Error(err: unknown): VerdaccioError {
+  const aws = (err ?? {}) as AwsError;
+  const errorName = String(aws.name || aws.code || '');
+  const status = aws.$metadata?.httpStatusCode || aws.statusCode;
+  debug('converting AWS error name=%o statusCode=%o message=%o', errorName, status, aws.message);
 
   switch (errorName) {
     case 'NoSuchKey':
@@ -48,9 +53,6 @@ export function convertS3Error(err: any): VerdaccioError {
     case 'RequestAbortedError':
       return errorUtils.getInternalError('request aborted');
     default:
-      return errorUtils.getCode(
-        err.$metadata?.httpStatusCode || err.statusCode || 500,
-        err.message
-      );
+      return errorUtils.getCode(status || 500, aws.message ?? '');
   }
 }

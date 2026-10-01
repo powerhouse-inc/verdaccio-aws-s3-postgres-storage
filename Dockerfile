@@ -12,7 +12,6 @@ RUN pnpm install --frozen-lockfile
 
 COPY tsconfig.json vite.config.ts ./
 COPY src/ ./src/
-COPY types/ ./types/
 RUN pnpm build
 
 # Prune dev dependencies for a lean install
@@ -26,11 +25,12 @@ FROM verdaccio/verdaccio:7.x-next
 USER root
 
 # Copy the built plugin into verdaccio's plugin directory
-RUN mkdir -p /verdaccio/plugins/verdaccio-aws-s3-storage
-COPY --from=builder /plugin/lib/          /verdaccio/plugins/verdaccio-aws-s3-storage/lib/
-COPY --from=builder /plugin/package.json  /verdaccio/plugins/verdaccio-aws-s3-storage/
+ARG PLUGIN_DIR=/verdaccio/plugins/@powerhousedao/verdaccio-s3-storage
+RUN mkdir -p $PLUGIN_DIR
+COPY --from=builder /plugin/lib/          $PLUGIN_DIR/lib/
+COPY --from=builder /plugin/package.json  $PLUGIN_DIR/
 
-COPY --from=builder /plugin/node_modules/ /verdaccio/plugins/verdaccio-aws-s3-storage/node_modules/
+COPY --from=builder /plugin/node_modules/ $PLUGIN_DIR/node_modules/
 
 # Bake the default config into the image
 COPY conf/config.yaml /verdaccio/conf/config.yaml

@@ -11,9 +11,12 @@ export default defineConfig({
   ],
   build: {
     lib: {
-      entry: resolve(__dirname, 'src/index.ts'),
+      entry: {
+        index: resolve(__dirname, 'src/index.ts'),
+        s3DatabasePostgres: resolve(__dirname, 'src/s3DatabasePostgres.ts'),
+      },
       formats: ['es'],
-      fileName: () => 'index.js',
+      fileName: (_format, name) => `${name}.js`,
     },
     rollupOptions: {
       output: {
@@ -32,6 +35,7 @@ export default defineConfig({
         /^@verdaccio\//,
         // Other deps
         'debug',
+        'pg',
         'http-errors',
       ],
     },

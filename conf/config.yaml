@@ -6,7 +6,7 @@ plugins: /verdaccio/plugins
 max_body_size: 100mb
 
 store:
-  aws-s3-storage:
+  '@powerhousedao/verdaccio-s3-storage':
     bucket: AWS_S3_BUCKET
     keyPrefix: AWS_S3_KEY_PREFIX
     region: AWS_DEFAULT_REGION
@@ -14,8 +14,7 @@ store:
     s3ForcePathStyle: true
     accessKeyId: AWS_ACCESS_KEY_ID
     secretAccessKey: AWS_SECRET_ACCESS_KEY
-    dynamoTableName: AWS_DYNAMO_TABLE_NAME
-    dynamoEndpoint: AWS_DYNAMO_ENDPOINT
+    postgresUrl: DATABASE_URL
 
 web:
   enable: true

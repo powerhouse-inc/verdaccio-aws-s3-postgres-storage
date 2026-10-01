@@ -1,7 +1,7 @@
 {
-  "name": "verdaccio-aws-s3-storage",
+  "name": "@powerhousedao/verdaccio-s3-storage",
   "version": "12.1.3",
-  "description": "AWS S3 storage implementation for Verdaccio",
+  "description": "Verdaccio storage plugin: package files in S3, registry state in Postgres. Fork of verdaccio-aws-s3-storage.",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -9,6 +9,10 @@
     ".": {
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
+    },
+    "./postgres": {
+      "types": "./lib/s3DatabasePostgres.d.ts",
+      "default": "./lib/s3DatabasePostgres.js"
     }
   },
   "engines": {
@@ -18,44 +22,46 @@
     "verdaccio",
     "plugin",
     "storage",
-    "aws"
+    "s3",
+    "postgres"
   ],
   "author": "Juan Picado <juanpicado19@gmail.com>",
   "license": "MIT",
-  "homepage": "https://verdaccio.org",
+  "homepage": "https://github.com/powerhouse-inc/verdaccio-aws-s3-postgres-storage#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/verdaccio/verdaccio-aws-s3-storage.git"
+    "url": "https://github.com/powerhouse-inc/verdaccio-aws-s3-postgres-storage.git"
   },
   "bugs": {
-    "url": "https://github.com/verdaccio/verdaccio-aws-s3-storage/issues"
+    "url": "https://github.com/powerhouse-inc/verdaccio-aws-s3-postgres-storage/issues"
   },
   "files": [
     "lib/"
   ],
   "packageManager": "pnpm@11.5.2+sha512.71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916",
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "3.1097.0",
     "@aws-sdk/client-s3": "3.1097.0",
-    "@aws-sdk/lib-dynamodb": "3.1097.0",
     "@aws-sdk/lib-storage": "3.1097.0",
     "@verdaccio/config": "9.0.0-next-9.32",
     "@verdaccio/core": "9.0.0-next-9.32",
     "@verdaccio/streams": "11.0.0-6-next.5",
-    "debug": "4.4.3"
+    "@verdaccio/types": "14.0.0-next-9.15",
+    "debug": "4.4.3",
+    "pg": "8.18.0"
   },
   "devDependencies": {
     "@changesets/changelog-github": "0.5.2",
     "@changesets/cli": "3.0.3",
     "@changesets/get-dependents-graph": "1.3.5",
+    "@electric-sql/pglite": "0.3.15",
     "@types/debug": "4.1.12",
     "@types/jsonwebtoken": "9.0.10",
     "@types/node": "25.5.0",
+    "@types/pg": "8.16.0",
     "@verdaccio/e2e-cli": "3.2.1",
     "@verdaccio/e2e-ui": "2.7.0",
     "@verdaccio/plugin-verifier": "1.0.0-next-9.28",
     "@verdaccio/registry-cli": "^1.1.0",
-    "@verdaccio/types": "14.0.0-next-9.15",
     "cross-env": "7.0.3",
     "cypress": "15.13.1",
     "oxfmt": "0.68.0",
@@ -68,8 +74,8 @@
   },
   "scripts": {
     "clean": "rimraf ./lib",
-    "test": "cross-env VERDACCIO_TEST_BUCKET=test vitest run",
-    "test:watch": "cross-env VERDACCIO_TEST_BUCKET=test vitest",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "type-check": "tsc --noEmit",
     "lint": "oxlint --ignore-path .oxlintignore .",
     "lint:fix": "oxlint --ignore-path .oxlintignore --fix .",
@@ -86,8 +92,8 @@
     "e2e:ui:run": "cypress run",
     "e2e:registry": "verdaccio-e2e --registry http://localhost:4873"
   },
-  "funding": {
-    "type": "opencollective",
-    "url": "https://opencollective.com/verdaccio"
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
   }
 }

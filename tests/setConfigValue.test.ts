@@ -1,4 +1,4 @@
-import setConfigValue from '../src/setConfigValue';
+import setConfigValue from '../src/setConfigValue.js';
 
 import {describe, test, expect, afterEach} from 'vitest';
 

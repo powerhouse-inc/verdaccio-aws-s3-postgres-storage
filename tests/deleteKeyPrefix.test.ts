@@ -1,4 +1,6 @@
-import {deleteKeyPrefix} from '../src/deleteKeyPrefix';
+// Upstream tests drive untyped AWS SDK mocks
+/* eslint-disable @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call, @typescript-eslint/require-await */
+import {deleteKeyPrefix} from '../src/deleteKeyPrefix.js';
 
 import {DeleteObjectsCommand} from '@aws-sdk/client-s3';
 import {describe, test, expect, vi} from 'vitest';

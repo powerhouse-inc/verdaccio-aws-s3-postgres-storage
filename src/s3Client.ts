@@ -1,4 +1,4 @@
-import type {S3Config} from '../types';
+import type {S3Config} from './types.js';
 
 import {S3Client} from '@aws-sdk/client-s3';
 import debugCore from 'debug';
@@ -18,6 +18,9 @@ export function createS3Client(config: S3Config): S3Client {
     endpoint: config.endpoint,
     region: config.region,
     forcePathStyle: config.s3ForcePathStyle,
+    // Checksums on every object cost CPU; S3 still gets them where required
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED',
     credentials: config.accessKeyId
       ? {
           accessKeyId: config.accessKeyId,

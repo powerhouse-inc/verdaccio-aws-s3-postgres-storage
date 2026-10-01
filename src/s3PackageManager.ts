@@ -1,28 +1,71 @@
-import {HEADERS} from '@verdaccio/core';
-import {ReadTarball, UploadTarball} from '@verdaccio/streams';
-import type {Callback, Logger, Package, ReadPackageCallback} from '@verdaccio/types';
+import {HEADERS, type VerdaccioError, type pluginUtils} from '@verdaccio/core';
+import type {Logger, Manifest} from '@verdaccio/types';
 
-import type {S3Config} from '../types';
-import addTrailingSlash from './addTrailingSlash';
-import {deleteKeyPrefix} from './deleteKeyPrefix';
-import {convertS3Error, create409Error, is404Error} from './s3Errors';
+import addTrailingSlash from './addTrailingSlash.js';
+import {deleteKeyPrefix} from './deleteKeyPrefix.js';
+import {convertS3Error, create409Error, is404Error} from './s3Errors.js';
+import type {ManifestIndex, ManifestIndexWriter, S3Config} from './types.js';
 
 import {
-  GetObjectCommand,
-  PutObjectCommand,
   DeleteObjectCommand,
+  GetObjectCommand,
   HeadObjectCommand,
+  PutObjectCommand,
 } from '@aws-sdk/client-s3';
 import type {ObjectCannedACL, S3Client} from '@aws-sdk/client-s3';
 import {Upload} from '@aws-sdk/lib-storage';
 import debugCore from 'debug';
-import type {Readable} from 'stream';
+import {randomBytes} from 'node:crypto';
+import {PassThrough, Writable, addAbortSignal} from 'node:stream';
+import type {Readable} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
 
 const debug = debugCore('verdaccio:plugin:aws-s3-storage:package');
 
 const pkgFileName = 'package.json';
 
-export default class S3PackageManager {
+// Manifests updatePackage already stored, with the stored `_rev`, so Verdaccio's follow-up save is skipped
+const stored = new WeakMap<object, string>();
+
+// Raw manifests by S3 key, served while their `_rev` matches the index's
+const manifestCache = new Map<string, {rev: string; body: string}>();
+const MANIFEST_CACHE_MAX = 2_000;
+
+function cacheManifest(key: string, rev: unknown, body: string): void {
+  if (typeof rev !== 'string' || !rev) return;
+  manifestCache.delete(key);
+  manifestCache.set(key, {rev, body});
+  if (manifestCache.size > MANIFEST_CACHE_MAX) {
+    manifestCache.delete(manifestCache.keys().next().value!);
+  }
+}
+
+// Keys @verdaccio/store's normalizePackage fills before every write
+const OBJECT_KEYS = [
+  'versions',
+  'dist-tags',
+  '_distfiles',
+  '_attachments',
+  '_uplinks',
+  'time',
+] as const;
+
+// Same shape as @verdaccio/store's generateRevision: "<counter>-<hex>"
+const revCounter = (rev: unknown) => (typeof rev === 'string' ? Number(rev.split('-')[0]) || 0 : 0);
+const nextRevision = (rev: unknown) => `${revCounter(rev) + 1}-${randomBytes(8).toString('hex')}`;
+
+function normalize(manifest: Manifest): Manifest {
+  const m = manifest as unknown as Record<string, unknown>;
+  for (const key of OBJECT_KEYS) {
+    const value = m[key];
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      m[key] = {};
+    }
+  }
+  return manifest;
+}
+
+export default class S3PackageManager implements pluginUtils.StorageHandler {
   public config: S3Config;
   public logger: Logger;
   private readonly packageName: string;
@@ -30,7 +73,13 @@ export default class S3PackageManager {
   private readonly packagePath: string;
   private readonly tarballACL: ObjectCannedACL;
 
-  public constructor(config: S3Config, packageName: string, logger: Logger, s3: S3Client) {
+  public constructor(
+    config: S3Config,
+    packageName: string,
+    logger: Logger,
+    s3: S3Client,
+    private readonly index?: ManifestIndex
+  ) {
     this.config = config;
     this.packageName = packageName;
     this.logger = logger;
@@ -49,447 +98,267 @@ export default class S3PackageManager {
     }
 
     debug(
-      'init package=%o path=%o bucket=%o acl=%o customStorage=%o',
+      'init package=%o path=%o bucket=%o acl=%o',
       packageName,
       this.packagePath,
       config.bucket,
-      this.tarballACL,
-      packageAccess?.storage ?? 'none'
-    );
-    this.logger.trace(
-      {packageName, packagePath: this.packagePath, bucket: config.bucket, acl: this.tarballACL},
-      'aws-s3-storage: [S3PackageManager] init package=@{packageName} path=@{packagePath} bucket=@{bucket} acl=@{acl}'
+      this.tarballACL
     );
   }
 
-  public updatePackage(
+  // Without an index Verdaccio writes the returned manifest itself; with one
+  // the whole read-modify-write runs under the package lock.
+  public async updatePackage(
     name: string,
-    updateHandler: Callback,
-    onWrite: Callback,
-    transformPackage: (pkg: Package) => Package,
-    onEnd: Callback
-  ): void {
-    debug('updatePackage name=%o path=%o', name, this.packagePath);
-    this.logger.trace(
-      {name, packagePath: this.packagePath},
-      'aws-s3-storage: [updatePackage] name=@{name} path=@{packagePath}'
-    );
-    void (async (): Promise<void> => {
-      try {
-        const json = await this._getData();
-        debug('updatePackage name=%o loaded, calling updateHandler', name);
-        this.logger.trace(
-          {name},
-          'aws-s3-storage: [updatePackage] data loaded for name=@{name}, running updateHandler'
-        );
-        updateHandler(json, (err: any) => {
-          if (err) {
-            debug('updatePackage name=%o updateHandler error: %o', name, err);
-            this.logger.trace(
-              {name, err},
-              'aws-s3-storage: [updatePackage] updateHandler error for name=@{name}'
-            );
-            onEnd(err);
-          } else {
-            const transformedPackage = transformPackage(json);
-            debug('updatePackage name=%o transformed, calling onWrite', name);
-            this.logger.trace(
-              {name},
-              'aws-s3-storage: [updatePackage] transformed name=@{name}, writing'
-            );
-            onWrite(name, transformedPackage, onEnd);
-          }
-        });
-      } catch (err) {
-        debug('updatePackage name=%o getData failed: %o', name, err);
-        this.logger.trace(
-          {name, err},
-          'aws-s3-storage: [updatePackage] getData failed for name=@{name}'
-        );
-        return onEnd(err);
-      }
-    })();
+    handleUpdate: (manifest: Manifest) => Promise<Manifest>
+  ): Promise<Manifest> {
+    debug('updatePackage name=%o', name);
+    if (!this.index) return handleUpdate(await this.readPackage(name));
+    return this.index.withPackageLock(this.packageName, async (index) => {
+      const manifest = normalize(await handleUpdate((await this.readFromS3(name)).manifest));
+      manifest._rev = nextRevision(manifest._rev);
+      await this.write(manifest, index);
+      stored.set(manifest, manifest._rev);
+      return manifest;
+    });
   }
 
-  private async _getData(): Promise<Package> {
-    const key = `${this.packagePath}/${pkgFileName}`;
-    debug('_getData bucket=%o key=%o', this.config.bucket, key);
-    this.logger.trace(
-      {bucket: this.config.bucket, key},
-      'aws-s3-storage: [_getData] fetching bucket=@{bucket} key=@{key}'
-    );
-    const response = await this.s3.send(
-      new GetObjectCommand({
-        Bucket: this.config.bucket,
-        Key: key,
-      })
-    );
+  // A primary-key lookup in the index replaces the S3 read and its parse
+  // whenever the cached copy is still the indexed revision
+  public async readPackage(name: string): Promise<Manifest> {
+    const key = this.key(pkgFileName);
+    const rev = await this.index?.revision(this.packageName);
+    const cached = manifestCache.get(key);
+    if (rev && cached?.rev === rev) return JSON.parse(cached.body) as Manifest;
+    const {manifest, body} = await this.readFromS3(name);
+    if (rev && manifest._rev === rev) cacheManifest(key, rev, body);
+    return manifest;
+  }
 
-    const bodyStr = (await response.Body?.transformToString()) ?? '';
+  private async readFromS3(name: string): Promise<{manifest: Manifest; body: string}> {
+    const key = this.key(pkgFileName);
+    debug('readPackage name=%o key=%o', name, key);
+    let body: string;
     try {
-      const data = JSON.parse(bodyStr);
-      debug(
-        '_getData loaded package=%o versions=%d',
-        data.name,
-        Object.keys(data.versions || {}).length
+      const response = await this.s3.send(
+        new GetObjectCommand({Bucket: this.config.bucket, Key: key})
       );
-      this.logger.trace(
-        {packageName: data.name, versions: Object.keys(data.versions || {}).length},
-        'aws-s3-storage: [_getData] loaded package=@{packageName} with @{versions} versions'
+      body = (await response.Body?.transformToString()) ?? '';
+    } catch (err) {
+      throw convertS3Error(err);
+    }
+    try {
+      return {manifest: JSON.parse(body) as Manifest, body};
+    } catch (err) {
+      this.logger.error(
+        {key, err},
+        'aws-s3-storage: invalid package.json at @{key}: @{err.message}'
       );
-      return data;
-    } catch (e) {
-      debug('_getData JSON parse error for key=%o bodyLength=%d', key, bodyStr.length);
-      this.logger.trace(
-        {key, bodyLength: bodyStr.length},
-        'aws-s3-storage: [_getData] JSON parse error key=@{key} bodyLength=@{bodyLength}'
-      );
-      throw e;
+      throw err;
     }
   }
 
-  public deletePackage(fileName: string, callback: Callback): void {
-    const key = `${this.packagePath}/${fileName}`;
-    debug('deletePackage bucket=%o key=%o', this.config.bucket, key);
-    this.logger.trace(
-      {bucket: this.config.bucket, key},
-      'aws-s3-storage: [deletePackage] deleting bucket=@{bucket} key=@{key}'
-    );
-    void (async (): Promise<void> => {
-      try {
-        await this.s3.send(
-          new DeleteObjectCommand({
-            Bucket: this.config.bucket,
-            Key: key,
-          })
-        );
-        debug('deletePackage key=%o deleted', key);
-        this.logger.trace({key}, 'aws-s3-storage: [deletePackage] deleted key=@{key}');
-        callback(null);
-      } catch (err) {
-        debug('deletePackage key=%o failed: %o', key, err);
-        this.logger.trace({key, err}, 'aws-s3-storage: [deletePackage] failed key=@{key}');
-        callback(err);
-      }
-    })();
+  public hasPackage(): Promise<boolean> {
+    return this.exists(this.key(pkgFileName));
   }
 
-  public removePackage(callback: (err: Error | null) => void): void {
-    const prefix = addTrailingSlash(this.packagePath);
-    debug('removePackage bucket=%o prefix=%o', this.config.bucket, prefix);
-    this.logger.trace(
-      {bucket: this.config.bucket, prefix},
-      'aws-s3-storage: [removePackage] removing all objects bucket=@{bucket} prefix=@{prefix}'
-    );
-    void (async (): Promise<void> => {
+  public async createPackage(name: string, manifest: Manifest): Promise<void> {
+    debug('createPackage name=%o', name);
+    await this.locked(async (index) => {
+      if (await this.hasPackage()) throw create409Error();
+      await this.write(manifest, index);
+    });
+  }
+
+  // With an index, a save whose revision isn't ahead of the stored one is stale and dropped
+  public async savePackage(name: string, manifest: Manifest): Promise<void> {
+    debug('savePackage name=%o', name);
+    // Verdaccio bumps `_rev` before the echo; restore the revision that was written
+    const persisted = stored.get(manifest);
+    if (persisted !== undefined) {
+      stored.delete(manifest);
+      manifest._rev = persisted;
+      return;
+    }
+    await this.locked(async (index) => {
+      if (index) {
+        const current = await this.storedRevision();
+        if (current !== null && revCounter(manifest._rev) <= revCounter(current)) {
+          this.logger.warn(
+            {name, rev: manifest._rev, current},
+            'aws-s3-storage: dropped stale save of @{name} (rev @{rev}, stored @{current})'
+          );
+          return;
+        }
+      }
+      await this.write(manifest, index);
+    });
+  }
+
+  public async deletePackage(fileName: string): Promise<void> {
+    const key = this.key(fileName);
+    debug('deletePackage key=%o', key);
+    await this.locked(async (index) => {
+      try {
+        await this.s3.send(new DeleteObjectCommand({Bucket: this.config.bucket, Key: key}));
+      } catch (err) {
+        throw convertS3Error(err);
+      }
+      if (fileName === pkgFileName) await index?.forget(this.packageName);
+    });
+  }
+
+  public async removePackage(): Promise<void> {
+    await this.locked(async (index) => {
+      await index?.forget(this.packageName);
+      const prefix = addTrailingSlash(this.packagePath);
+      debug('removePackage prefix=%o', prefix);
       try {
         await deleteKeyPrefix(this.s3, {
           Bucket: this.config.bucket,
           Prefix: prefix,
         });
-        debug('removePackage prefix=%o removed', prefix);
-        this.logger.trace({prefix}, 'aws-s3-storage: [removePackage] removed prefix=@{prefix}');
-        callback(null);
-      } catch (err: any) {
-        if (is404Error(err)) {
-          debug('removePackage prefix=%o already empty (404), ignoring', prefix);
-          this.logger.trace(
-            {prefix},
-            'aws-s3-storage: [removePackage] prefix=@{prefix} already empty, ignoring 404'
-          );
-          callback(null);
-        } else {
-          debug('removePackage prefix=%o failed: %o', prefix, err);
-          this.logger.trace(
-            {prefix, err},
-            'aws-s3-storage: [removePackage] failed prefix=@{prefix}'
-          );
-          callback(err);
-        }
+      } catch (err) {
+        if (!is404Error(err as VerdaccioError)) throw err;
       }
-    })();
-  }
-
-  public createPackage(name: string, value: Package, callback: (err: Error | null) => void): void {
-    const key = `${this.packagePath}/${pkgFileName}`;
-    debug('createPackage name=%o bucket=%o key=%o', name, this.config.bucket, key);
-    this.logger.trace(
-      {name, bucket: this.config.bucket, key},
-      'aws-s3-storage: [createPackage] checking if name=@{name} exists at key=@{key}'
-    );
-    void (async (): Promise<void> => {
-      try {
-        await this.s3.send(
-          new HeadObjectCommand({
-            Bucket: this.config.bucket,
-            Key: key,
-          })
-        );
-        debug('createPackage name=%o already exists → 409', name);
-        this.logger.trace(
-          {name, key},
-          'aws-s3-storage: [createPackage] name=@{name} already exists, returning 409'
-        );
-        callback(create409Error());
-      } catch (headErr: any) {
-        const s3Err = convertS3Error(headErr);
-        if (is404Error(s3Err)) {
-          debug('createPackage name=%o not found → creating', name);
-          this.logger.trace(
-            {name, key},
-            'aws-s3-storage: [createPackage] name=@{name} not found, saving new package'
-          );
-          this.savePackage(name, value, callback);
-        } else {
-          debug('createPackage name=%o headObject error: %o', name, s3Err.message);
-          this.logger.trace(
-            {name, error: s3Err.message},
-            'aws-s3-storage: [createPackage] headObject error for name=@{name}: @{error}'
-          );
-          callback(s3Err);
-        }
-      }
-    })();
-  }
-
-  public savePackage(name: string, value: Package, callback: (err: Error | null) => void): void {
-    const key = `${this.packagePath}/${pkgFileName}`;
-    debug('savePackage name=%o bucket=%o key=%o', name, this.config.bucket, key);
-    this.logger.trace(
-      {name, bucket: this.config.bucket, key},
-      'aws-s3-storage: [savePackage] writing name=@{name} to bucket=@{bucket} key=@{key}'
-    );
-    void (async (): Promise<void> => {
-      try {
-        await this.s3.send(
-          new PutObjectCommand({
-            Body: JSON.stringify(value, null, '  '),
-            Bucket: this.config.bucket,
-            Key: key,
-          })
-        );
-        debug('savePackage name=%o saved', name);
-        this.logger.trace(
-          {name, key},
-          'aws-s3-storage: [savePackage] name=@{name} written to key=@{key}'
-        );
-        callback(null);
-      } catch (err: any) {
-        debug('savePackage name=%o failed: %o', name, err.message);
-        this.logger.trace(
-          {name, error: err.message},
-          'aws-s3-storage: [savePackage] name=@{name} write failed: @{error}'
-        );
-        callback(err);
-      }
-    })();
-  }
-
-  public readPackage(name: string, callback: ReadPackageCallback): void {
-    debug('readPackage name=%o path=%o', name, this.packagePath);
-    this.logger.trace(
-      {name, packagePath: this.packagePath},
-      'aws-s3-storage: [readPackage] reading name=@{name} from path=@{packagePath}'
-    );
-    void (async (): Promise<void> => {
-      try {
-        const data = await this._getData();
-        debug('readPackage name=%o success', name);
-        this.logger.trace({name}, 'aws-s3-storage: [readPackage] name=@{name} read successfully');
-        callback(null, data);
-      } catch (err: any) {
-        debug('readPackage name=%o failed: %o', name, err.message);
-        this.logger.trace(
-          {name, error: err.message},
-          'aws-s3-storage: [readPackage] name=@{name} failed: @{error}'
-        );
-        callback(convertS3Error(err));
-      }
-    })();
-  }
-
-  public writeTarball(name: string): UploadTarball {
-    const key = `${this.packagePath}/${name}`;
-    debug(
-      'writeTarball name=%o bucket=%o key=%o acl=%o',
-      name,
-      this.config.bucket,
-      key,
-      this.tarballACL
-    );
-    this.logger.trace(
-      {name, bucket: this.config.bucket, key, acl: this.tarballACL},
-      'aws-s3-storage: [writeTarball] starting upload name=@{name} bucket=@{bucket} key=@{key} acl=@{acl}'
-    );
-    const uploadStream = new UploadTarball({});
-
-    let streamEnded = 0;
-    uploadStream.on('end', () => {
-      debug('writeTarball name=%o stream ended', name);
-      this.logger.trace({name}, 'aws-s3-storage: [writeTarball] stream ended for name=@{name}');
-      streamEnded = 1;
     });
-
-    void (async (): Promise<void> => {
-      try {
-        await this.s3.send(
-          new HeadObjectCommand({
-            Bucket: this.config.bucket,
-            Key: key,
-          })
-        );
-        debug('writeTarball name=%o already exists → 409', name);
-        this.logger.trace(
-          {name, key},
-          'aws-s3-storage: [writeTarball] name=@{name} already exists at key=@{key}, emitting 409'
-        );
-        uploadStream.emit('error', create409Error());
-      } catch (headErr: any) {
-        const convertedErr = convertS3Error(headErr);
-        if (!is404Error(convertedErr)) {
-          debug('writeTarball name=%o headObject unexpected error: %o', name, convertedErr.message);
-          this.logger.trace(
-            {name, error: convertedErr.message},
-            'aws-s3-storage: [writeTarball] headObject unexpected error for name=@{name}: @{error}'
-          );
-          uploadStream.emit('error', convertedErr);
-          return;
-        }
-
-        debug('writeTarball name=%o not found → starting upload', name);
-        this.logger.trace(
-          {name, key},
-          'aws-s3-storage: [writeTarball] name=@{name} not found, initiating multipart upload to key=@{key}'
-        );
-        const upload = new Upload({
-          client: this.s3,
-          params: {
-            Bucket: this.config.bucket,
-            Key: key,
-            Body: uploadStream,
-            ACL: this.tarballACL,
-          },
-        });
-
-        const uploadPromise = upload.done().catch((err) => {
-          debug('writeTarball name=%o upload failed: %o', name, err.message);
-          this.logger.trace(
-            {name, error: err.message},
-            'aws-s3-storage: [writeTarball] upload failed for name=@{name}: @{error}'
-          );
-          const error = convertS3Error(err);
-          uploadStream.emit('error', error);
-          throw error;
-        });
-
-        // An aborted client never calls done(), so nothing would await this rejection.
-        void uploadPromise.catch(() => {});
-
-        uploadStream.emit('open');
-        this.logger.trace({name}, 'aws-s3-storage: [writeTarball] emitted open for name=@{name}');
-
-        uploadStream.done = (): void => {
-          const onEnd = async (): Promise<void> => {
-            try {
-              await uploadPromise;
-              debug('writeTarball name=%o upload complete', name);
-              this.logger.trace(
-                {name, key},
-                'aws-s3-storage: [writeTarball] upload complete name=@{name} key=@{key}'
-              );
-              uploadStream.emit('success');
-            } catch {
-              // error already emitted above
-            }
-          };
-          if (streamEnded) {
-            void onEnd();
-          } else {
-            uploadStream.on('end', () => void onEnd());
-          }
-        };
-
-        uploadStream.abort = (): void => {
-          debug('writeTarball name=%o aborting upload', name);
-          this.logger.trace(
-            {name, key},
-            'aws-s3-storage: [writeTarball] aborting upload name=@{name}, cleaning up key=@{key}'
-          );
-          try {
-            void upload.abort();
-          } catch (err: any) {
-            uploadStream.emit('error', convertS3Error(err));
-          }
-          void this.s3
-            .send(new DeleteObjectCommand({Bucket: this.config.bucket, Key: key}))
-            .catch(() => {});
-          debug('writeTarball name=%o abort cleanup sent', name);
-        };
-      }
-    })();
-
-    return uploadStream;
   }
 
-  public readTarball(name: string): ReadTarball {
-    const key = `${this.packagePath}/${name}`;
-    debug('readTarball name=%o bucket=%o key=%o', name, this.config.bucket, key);
-    this.logger.trace(
-      {name, bucket: this.config.bucket, key},
-      'aws-s3-storage: [readTarball] reading name=@{name} from bucket=@{bucket} key=@{key}'
-    );
-    const readTarballStream = new ReadTarball({});
+  public hasTarball(fileName: string): Promise<boolean> {
+    return this.exists(this.key(fileName));
+  }
 
-    void (async (): Promise<void> => {
-      try {
-        const response = await this.s3.send(
-          new GetObjectCommand({
-            Bucket: this.config.bucket,
-            Key: key,
-          })
-        );
-
-        const contentLength = response.ContentLength;
-        debug('readTarball name=%o contentLength=%o', name, contentLength);
-        this.logger.trace(
-          {name, contentLength},
-          'aws-s3-storage: [readTarball] name=@{name} fetched, contentLength=@{contentLength}'
-        );
-        if (contentLength) {
-          readTarballStream.emit(HEADERS.CONTENT_LENGTH, contentLength);
-        }
-        readTarballStream.emit('open');
-
-        const bodyStream = response.Body as Readable;
-        bodyStream.on('error', (err) => {
-          debug('readTarball name=%o stream error: %o', name, (err as any).message);
-          this.logger.trace(
-            {name, error: (err as any).message},
-            'aws-s3-storage: [readTarball] stream error for name=@{name}: @{error}'
-          );
-          readTarballStream.emit('error', convertS3Error(err as any));
-        });
-        bodyStream.pipe(readTarballStream);
-        this.logger.trace({name}, 'aws-s3-storage: [readTarball] piping stream for name=@{name}');
-
-        readTarballStream.abort = (): void => {
-          debug('readTarball name=%o aborting stream', name);
-          this.logger.trace(
-            {name},
-            'aws-s3-storage: [readTarball] aborting stream for name=@{name}'
-          );
-          bodyStream.destroy();
-        };
-      } catch (err: any) {
-        debug('readTarball name=%o failed: %o', name, err.message);
-        this.logger.trace(
-          {name, error: err.message},
-          'aws-s3-storage: [readTarball] failed for name=@{name}: @{error}'
-        );
-        readTarballStream.emit('error', convertS3Error(err));
+  // Emits "open" once the upload starts and "close" only after S3 has stored the object
+  public writeTarball(fileName: string, {signal}: {signal: AbortSignal}): Promise<Writable> {
+    const key = this.key(fileName);
+    debug('writeTarball key=%o acl=%o', key, this.tarballACL);
+    const body = new PassThrough();
+    const upload = new Upload({
+      client: this.s3,
+      params: {
+        Bucket: this.config.bucket,
+        Key: key,
+        Body: body,
+        ACL: this.tarballACL,
+      },
+    });
+    const uploaded = upload.done().then(
+      () => undefined,
+      (err: unknown) => {
+        throw convertS3Error(err);
       }
-    })();
+    );
+    let stored = false;
 
-    return readTarballStream;
+    const stream = new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        if (body.write(chunk)) callback();
+        else body.once('drain', () => callback());
+      },
+      final(callback) {
+        body.end();
+        uploaded.then(
+          () => {
+            stored = true;
+            debug('writeTarball key=%o stored', key);
+            callback();
+          },
+          (err: Error) => callback(err)
+        );
+      },
+      destroy: (err, callback) => {
+        if (!stored) {
+          body.destroy();
+          void upload.abort().catch(() => undefined);
+        }
+        callback(err);
+      },
+    });
+    uploaded.catch((err: Error) => stream.destroy(err));
+    addAbortSignal(signal, stream);
+    setImmediate(() => {
+      if (!stream.destroyed) stream.emit('open');
+    });
+    return Promise.resolve(stream);
+  }
+
+  // Emits "open" once S3 answers; a missing object fails with a 404 error
+  public readTarball(fileName: string, {signal}: {signal: AbortSignal}): Promise<Readable> {
+    const key = this.key(fileName);
+    debug('readTarball key=%o', key);
+    const stream = addAbortSignal(signal, new PassThrough());
+    this.s3
+      .send(new GetObjectCommand({Bucket: this.config.bucket, Key: key}), {
+        abortSignal: signal,
+      })
+      .then(
+        (response) => {
+          if (stream.destroyed) {
+            (response.Body as Readable | undefined)?.destroy();
+            return;
+          }
+          if (response.ContentLength) {
+            stream.emit(HEADERS.CONTENT_LENGTH, response.ContentLength);
+          }
+          stream.emit('open');
+          pipeline(response.Body as Readable, stream).catch((err: unknown) =>
+            stream.destroy(convertS3Error(err))
+          );
+        },
+        (err: unknown) => {
+          debug('readTarball key=%o failed: %o', key, err);
+          stream.destroy(convertS3Error(err));
+        }
+      );
+    return Promise.resolve(stream);
+  }
+
+  // Runs fn under the package lock when there is an index, else directly
+  private locked<T>(fn: (index: ManifestIndexWriter | undefined) => Promise<T>): Promise<T> {
+    return this.index ? this.index.withPackageLock(this.packageName, fn) : fn(undefined);
+  }
+
+  // S3 first, so the index never names a manifest S3 doesn't hold
+  private async write(manifest: Manifest, index: ManifestIndexWriter | undefined): Promise<void> {
+    const body = JSON.stringify(manifest, null, '  ');
+    try {
+      await this.s3.send(
+        new PutObjectCommand({
+          Body: body,
+          Bucket: this.config.bucket,
+          Key: this.key(pkgFileName),
+        })
+      );
+    } catch (err) {
+      throw convertS3Error(err);
+    }
+    // A failed index update must not leave the old body cached under the old revision
+    manifestCache.delete(this.key(pkgFileName));
+    await index?.record(this.packageName, manifest);
+    cacheManifest(this.key(pkgFileName), manifest._rev, body);
+  }
+
+  private async storedRevision(): Promise<string | null> {
+    try {
+      return (await this.readFromS3(this.packageName)).manifest._rev;
+    } catch (err) {
+      if (is404Error(err as VerdaccioError)) return null;
+      throw err;
+    }
+  }
+
+  private key(fileName: string): string {
+    return `${this.packagePath}/${fileName}`;
+  }
+
+  private async exists(key: string): Promise<boolean> {
+    try {
+      await this.s3.send(new HeadObjectCommand({Bucket: this.config.bucket, Key: key}));
+      return true;
+    } catch (err) {
+      const converted = convertS3Error(err);
+      if (is404Error(converted)) return false;
+      throw converted;
+    }
   }
 }

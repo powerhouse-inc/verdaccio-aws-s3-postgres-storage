@@ -1,4 +1,4 @@
-import {create404Error} from './s3Errors';
+import {create404Error} from './s3Errors.js';
 
 import type {S3Client} from '@aws-sdk/client-s3';
 import {ListObjectsV2Command, DeleteObjectsCommand} from '@aws-sdk/client-s3';
@@ -19,7 +19,9 @@ export async function deleteKeyPrefix(
   const listResponse = await s3.send(new ListObjectsV2Command(options));
 
   if (listResponse.KeyCount) {
-    const objectsToDelete = (listResponse.Contents || []).map((obj) => ({Key: obj.Key!}));
+    const objectsToDelete = (listResponse.Contents || []).map((obj) => ({
+      Key: obj.Key!,
+    }));
     debug('deleting %d objects from bucket=%o', objectsToDelete.length, options.Bucket);
     await s3.send(
       new DeleteObjectsCommand({
