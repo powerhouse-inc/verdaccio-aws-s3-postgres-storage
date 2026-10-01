@@ -1,12 +1,10 @@
 name: Changesets
 
 on:
-  schedule:
-    - cron: '0 0 * * *'
-
   push:
     branches:
       - master
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -15,26 +13,28 @@ permissions:
 
 env:
   CI: true
-  PNPM_CACHE_FOLDER: .pnpm-store
   NPM_CONFIG_PROVENANCE: 'true'
 
+concurrency:
+  group: changesets-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  # Open/refresh the "build: release packages" version PR from changesets.
-  # Runs freely on every push/cron (no environment gate, no publish).
+  # Opens or refreshes the "build: release packages" PR while changesets are pending
   version:
     timeout-minutes: 14
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/master' && github.repository == 'verdaccio/verdaccio-aws-s3-storage'
+    if: github.ref == 'refs/heads/master' && github.repository == 'powerhouse-inc/verdaccio-aws-s3-postgres-storage'
     outputs:
       has-changesets: ${{ steps.changesets.outputs.has-changesets }}
     steps:
       - name: checkout code repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: setup node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
       - name: install pnpm
@@ -43,36 +43,33 @@ jobs:
           corepack enable
           corepack install
       - name: install dependencies
-        run: pnpm install
-      - name: build
-        run: pnpm build
+        run: pnpm install --frozen-lockfile
       - name: create versions
         id: changesets
         uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
-          # Pass the release PAT explicitly so version PRs trigger CI.
-          github-token: ${{ secrets.CHANGESET_RELEASE_TOKEN }}
+          # A PAT lets the version PR trigger CI; GITHUB_TOKEN works but skips it
+          github-token: ${{ secrets.CHANGESET_RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           version-script: pnpm ci:version
           commit-message: 'build: release packages'
           pr-title: 'build: release packages'
 
-  # Publish to npm once the version PR has been merged (no changesets left).
-  # Gated by the `npm` environment, which requires manual approval.
-  # Skipped on the daily cron so it never nags when there is nothing to publish.
+  # Publishes once the version PR is merged and no changesets are left
   publish:
     needs: version
-    if: needs.version.outputs.has-changesets == 'false' && github.event_name != 'schedule'
+    if: needs.version.outputs.has-changesets == 'false'
     timeout-minutes: 14
     runs-on: ubuntu-latest
+    # Add required reviewers to this environment to gate publishing
     environment: npm
     steps:
       - name: checkout code repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: setup node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
       - name: install pnpm
@@ -81,13 +78,16 @@ jobs:
           corepack enable
           corepack install
       - name: install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
       - name: build
         run: pnpm build
+      - name: test
+        run: pnpm test
+      # Trusted publishing (OIDC); a new package's first version is published by hand
       - name: publish
         uses: changesets/action@ae32849d5ba541f9ae29e40e22a623bc13562f51 # v2.1.2
         with:
-          github-token: ${{ secrets.CHANGESET_RELEASE_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           publish-script: pnpm ci:publish
           create-github-releases: true
         env:
